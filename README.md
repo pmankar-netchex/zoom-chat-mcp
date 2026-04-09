@@ -49,14 +49,15 @@ The server runs with [FastMCP](https://github.com/jlowin/fastmcp) and speaks MCP
 
 ### Cursor / MCP client config
 
-Point your client at the interpreter and `server.py`, for example:
+Point your client at `uv` and `server.py` with the working directory set to this repository (relative script, no hard-coded filesystem paths):
 
 ```json
 {
   "mcpServers": {
     "zoom-chat": {
       "command": "uv",
-      "args": ["run", "python", "/absolute/path/to/zoom-chat-mcp/server.py"],
+      "args": ["run", "python", "server.py"],
+      "cwd": "${workspaceFolder}",
       "env": {
         "ZOOM_CLIENT_ID": "your-client-id",
         "ZOOM_CLIENT_SECRET": "your-client-secret"
@@ -66,7 +67,7 @@ Point your client at the interpreter and `server.py`, for example:
 }
 ```
 
-Adjust paths and how you pass `env` to match your setup.
+Open the cloned repo as the workspace folder so `${workspaceFolder}` resolves correctly (or set `cwd` to whatever your MCP client uses for the project root). Adjust `env` as needed for your Zoom app.
 
 ## Tools
 
