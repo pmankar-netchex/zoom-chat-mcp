@@ -12,6 +12,7 @@ import threading
 import urllib.parse
 import webbrowser
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +30,8 @@ mcp = FastMCP(
 
 REDIRECT_PORT = 4199
 OAUTH_CALLBACK_TIMEOUT_S = 180
+HTTP_TIMEOUT_S = 15  # timeout per Zoom API request
+MAX_WORKERS = 8  # parallel channel fetches
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 ZOOM_AUTH_URL = "https://zoom.us/oauth/authorize"
 ZOOM_TOKEN_URL = "https://zoom.us/oauth/token"
@@ -82,6 +85,7 @@ def _refresh_access_token(refresh_token: str) -> str | None:
             "Content-Type": "application/x-www-form-urlencoded",
         },
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=HTTP_TIMEOUT_S,
     )
     if resp.status_code == 200:
         token_data = resp.json()
@@ -152,6 +156,7 @@ def _get_access_token_via_oauth() -> str:
             "code": _auth_code_result["code"],
             "redirect_uri": REDIRECT_URI,
         },
+        timeout=HTTP_TIMEOUT_S,
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Token exchange failed: {resp.status_code} — {resp.text[:300]}")
@@ -177,6 +182,7 @@ def _api_get(token: str, endpoint: str, params: dict | None = None) -> dict | No
         f"{ZOOM_API_BASE}{endpoint}",
         headers={"Authorization": f"Bearer {token}"},
         params=params or {},
+        timeout=HTTP_TIMEOUT_S,
     )
     if resp.status_code == 200:
         return resp.json()
@@ -324,27 +330,31 @@ def scan_recent_chats(hours: int = 6) -> dict:
 
     type_labels = {1: "DM", 2: "Private Channel", 3: "Public Channel", 4: "Meeting Chat", 5: "New Chat"}
 
-    # Messages
-    all_messages = []
-    for ch in channels:
+    dates_to_check = set()
+    current = lookback_start.date()
+    end = now.date()
+    while current <= end:
+        dates_to_check.add(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    sorted_dates = sorted(dates_to_check)
+
+    # Fetch messages from one channel (runs in thread pool)
+    def _fetch_channel_messages(ch):
         ch_jid = ch.get("jid", ch.get("id", ""))
         ch_name = ch.get("name", "Direct Message")
         ch_type = ch.get("type", 0)
-
-        dates_to_check = set()
-        current = lookback_start.date()
-        end = now.date()
-        while current <= end:
-            dates_to_check.add(current.strftime("%Y-%m-%d"))
-            current += timedelta(days=1)
-
-        for date_str in sorted(dates_to_check):
+        ch_type_label = type_labels.get(ch_type, f"Type {ch_type}")
+        msgs = []
+        for date_str in sorted_dates:
             npt = ""
             while True:
                 params = {"to_channel": ch_jid, "date": date_str, "page_size": 50}
                 if npt:
                     params["next_page_token"] = npt
-                data = _api_get(token, "/chat/users/me/messages", params)
+                try:
+                    data = _api_get(token, "/chat/users/me/messages", params)
+                except Exception:
+                    break
                 if not data:
                     break
                 for msg in data.get("messages", []):
@@ -354,17 +364,28 @@ def scan_recent_chats(hours: int = 6) -> dict:
                             msg_time = datetime.fromisoformat(msg_time_str.replace("Z", "+00:00"))
                             if lookback_start <= msg_time <= now:
                                 msg["_channel_name"] = ch_name
-                                msg["_channel_type"] = type_labels.get(ch_type, f"Type {ch_type}")
-                                all_messages.append(msg)
+                                msg["_channel_type"] = ch_type_label
+                                msgs.append(msg)
                             continue
                         except (ValueError, TypeError):
                             pass
                     msg["_channel_name"] = ch_name
-                    msg["_channel_type"] = type_labels.get(ch_type, f"Type {ch_type}")
-                    all_messages.append(msg)
+                    msg["_channel_type"] = ch_type_label
+                    msgs.append(msg)
                 npt = data.get("next_page_token", "")
                 if not npt:
                     break
+        return msgs
+
+    # Messages — fetch channels in parallel
+    all_messages = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_channel_messages, ch): ch for ch in channels}
+        for future in as_completed(futures):
+            try:
+                all_messages.extend(future.result())
+            except Exception:
+                pass  # skip channels that error out entirely
 
     # Relevance analysis
     enriched = _analyze_relevance(all_messages, my_email, my_name, my_member_id)
