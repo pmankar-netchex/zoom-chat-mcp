@@ -5,8 +5,10 @@ Exposes Zoom Chat API operations as MCP tools.
 """
 
 import base64
+import hashlib
 import http.server
 import json
+import secrets
 import sys
 import threading
 import urllib.parse
@@ -19,7 +21,7 @@ from pathlib import Path
 import requests
 from mcp.server.fastmcp import FastMCP
 
-IST = timezone(timedelta(hours=5, minutes=30))
+UTC = timezone.utc
 
 mcp = FastMCP(
     "Zoom Chat",
@@ -32,7 +34,7 @@ REDIRECT_PORT = 4199
 OAUTH_CALLBACK_TIMEOUT_S = 180
 HTTP_TIMEOUT_S = 15  # timeout per Zoom API request
 MAX_WORKERS = 8  # parallel channel fetches
-REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
+REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/oauth/callback"
 ZOOM_AUTH_URL = "https://zoom.us/oauth/authorize"
 ZOOM_TOKEN_URL = "https://zoom.us/oauth/token"
 ZOOM_API_BASE = "https://api.zoom.us/v2"
@@ -66,7 +68,7 @@ def _save_token_cache(token_data: dict) -> dict:
     cache = {
         "access_token": token_data["access_token"],
         "refresh_token": token_data.get("refresh_token", ""),
-        "expires_at": (datetime.now(IST) + timedelta(seconds=token_data.get("expires_in", 3600))).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(seconds=token_data.get("expires_in", 3600))).isoformat(),
     }
     p = _token_cache_path()
     p.write_text(json.dumps(cache, indent=2))
@@ -74,9 +76,20 @@ def _save_token_cache(token_data: dict) -> dict:
     return cache
 
 
+def _invalidate_token_cache():
+    """Remove the token cache so the next attempt starts fresh."""
+    p = _token_cache_path()
+    if p.exists():
+        p.unlink()
+        print(f"Cleared stale token cache: {p}", file=sys.stderr)
+
+
 def _refresh_access_token(refresh_token: str) -> str | None:
-    client_id = _get_env("ZOOM_CLIENT_ID")
-    client_secret = _get_env("ZOOM_CLIENT_SECRET")
+    client_id = _get_env("ZOOM_CLIENT_ID").strip()
+    client_secret = _get_env("ZOOM_CLIENT_SECRET").strip()
+    if not client_id or not client_secret:
+        print("Refresh failed: ZOOM_CLIENT_ID or ZOOM_CLIENT_SECRET not set", file=sys.stderr)
+        return None
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     resp = requests.post(
         ZOOM_TOKEN_URL,
@@ -91,19 +104,42 @@ def _refresh_access_token(refresh_token: str) -> str | None:
         token_data = resp.json()
         _save_token_cache(token_data)
         return token_data["access_token"]
+    error_body = resp.text[:300]
+    print(f"Refresh failed: {resp.status_code} — {error_body}", file=sys.stderr)
+    if "invalid_client" in error_body:
+        print(
+            "ERROR: Zoom rejected client credentials. Check that your Zoom app is "
+            "still active at marketplace.zoom.us and that ZOOM_CLIENT_ID / "
+            "ZOOM_CLIENT_SECRET are correct.",
+            file=sys.stderr,
+        )
+        _invalidate_token_cache()
     return None
 
 
 # ── OAuth browser flow ───────────────────────────────────────
 
-_auth_code_result = {"code": None}
+_auth_code_result = {"code": None, "expected_state": None}
 
 
 class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        query = urllib.parse.urlparse(self.path).query
-        params = urllib.parse.parse_qs(query)
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/oauth/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        params = urllib.parse.parse_qs(parsed.query)
         if "code" in params:
+            # Verify state to prevent CSRF
+            received_state = params.get("state", [None])[0]
+            expected_state = _auth_code_result.get("expected_state")
+            if expected_state and received_state != expected_state:
+                self.send_response(403)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body><h2>Error: state mismatch (possible CSRF)</h2></body></html>")
+                return
             _auth_code_result["code"] = params["code"][0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -120,18 +156,63 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _generate_pkce() -> tuple[str, str]:
+    """Generate PKCE code_verifier and S256 code_challenge."""
+    code_verifier = secrets.token_urlsafe(64)  # 86 chars (within 43-128 range)
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return code_verifier, code_challenge
+
+
+def _serve_until_callback(server: http.server.HTTPServer) -> None:
+    """Handle HTTP requests in a loop until the OAuth callback arrives."""
+    while _auth_code_result["code"] is None:
+        server.handle_request()
+
+
 def _get_access_token_via_oauth() -> str:
-    client_id = _get_env("ZOOM_CLIENT_ID")
-    client_secret = _get_env("ZOOM_CLIENT_SECRET")
+    client_id = _get_env("ZOOM_CLIENT_ID").strip()
+    client_secret = _get_env("ZOOM_CLIENT_SECRET").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            f"Missing credentials: ZOOM_CLIENT_ID={'set' if client_id else 'EMPTY'}, "
+            f"ZOOM_CLIENT_SECRET={'set' if client_secret else 'EMPTY'}. "
+            f"Set these environment variables in your MCP client config."
+        )
+
+    # Validate credentials before opening a browser
+    _validate_client_credentials(client_id, client_secret)
+
+    print(f"OAuth: client_id={client_id[:6]}…, secret_len={len(client_secret)}", file=sys.stderr)
+
+    # PKCE
+    code_verifier, code_challenge = _generate_pkce()
+
+    # CSRF state
+    state = secrets.token_urlsafe(32)
+
+    # Reset stale auth code from any previous attempt
+    _auth_code_result["code"] = None
+    _auth_code_result["expected_state"] = state
+
     server = http.server.HTTPServer(("localhost", REDIRECT_PORT), _OAuthCallbackHandler)
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    server.timeout = 5  # short timeout so the loop re-checks the condition
+    server_thread = threading.Thread(target=_serve_until_callback, args=(server,), daemon=True)
     server_thread.start()
 
     auth_url = (
         f"{ZOOM_AUTH_URL}?response_type=code"
         f"&client_id={client_id}"
         f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+        f"&code_challenge={code_challenge}"
+        f"&code_challenge_method=S256"
+        f"&state={state}"
     )
+    # Optional explicit scopes (otherwise uses scopes configured in the Zoom app)
+    zoom_scopes = _get_env("ZOOM_SCOPES").strip()
+    if zoom_scopes:
+        auth_url += f"&scope={urllib.parse.quote(zoom_scopes)}"
+
     print(f"Opening browser for Zoom authorization...", file=sys.stderr)
     print(f"   If it doesn't open, visit:\n   {auth_url}\n", file=sys.stderr)
     webbrowser.open(auth_url)
@@ -155,23 +236,76 @@ def _get_access_token_via_oauth() -> str:
             "grant_type": "authorization_code",
             "code": _auth_code_result["code"],
             "redirect_uri": REDIRECT_URI,
+            "code_verifier": code_verifier,
         },
         timeout=HTTP_TIMEOUT_S,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"Token exchange failed: {resp.status_code} — {resp.text[:300]}")
+        error_body = resp.text[:300]
+        if "invalid_client" in error_body:
+            raise RuntimeError(
+                f"Zoom rejected client credentials during token exchange. "
+                f"Your Zoom app may be deactivated — check marketplace.zoom.us. "
+                f"Raw: {error_body}"
+            )
+        raise RuntimeError(f"Token exchange failed: {resp.status_code} — {error_body}")
 
     token_data = resp.json()
     _save_token_cache(token_data)
     return token_data["access_token"]
 
 
+def _validate_client_credentials(client_id: str, client_secret: str):
+    """Quick check that Zoom recognizes the client credentials.
+
+    Uses a dummy authorization_code exchange — Zoom validates the client
+    before checking the code, so 'invalid_grant' means credentials are OK
+    while 'invalid_client' means they are not.
+    """
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    try:
+        resp = requests.post(
+            ZOOM_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": "__validation_probe__",
+                "redirect_uri": REDIRECT_URI,
+            },
+            timeout=HTTP_TIMEOUT_S,
+        )
+        if "invalid_client" in resp.text:
+            raise RuntimeError(
+                f"Zoom does not recognize these client credentials "
+                f"(client_id={client_id[:6]}…). The Zoom app may have been "
+                f"deactivated or its secret regenerated. Visit marketplace.zoom.us "
+                f"to check the app status and update ZOOM_CLIENT_SECRET in your "
+                f"MCP client config."
+            )
+    except requests.RequestException:
+        pass  # network error — let the actual OAuth flow handle it
+
+
 def _get_access_token() -> str:
     cached = _load_cached_token()
-    if cached and cached.get("refresh_token"):
-        token = _refresh_access_token(cached["refresh_token"])
-        if token:
-            return token
+    if cached:
+        # Use cached access token if it hasn't expired yet
+        expires_at = cached.get("expires_at", "")
+        if expires_at and cached.get("access_token"):
+            try:
+                expiry = datetime.fromisoformat(expires_at)
+                if datetime.now(UTC) < expiry - timedelta(minutes=5):
+                    return cached["access_token"]
+            except (ValueError, TypeError):
+                pass
+        # Otherwise try refreshing
+        if cached.get("refresh_token"):
+            token = _refresh_access_token(cached["refresh_token"])
+            if token:
+                return token
     return _get_access_token_via_oauth()
 
 
@@ -192,6 +326,25 @@ def _api_get(token: str, endpoint: str, params: dict | None = None) -> dict | No
 
 
 # ── MCP Tools ────────────────────────────────────────────────
+
+@mcp.tool()
+def reconnect_zoom() -> dict:
+    """Clear cached tokens and re-authenticate with Zoom.
+
+    Use this when you get authentication errors. It clears the token cache
+    and triggers a fresh OAuth browser flow.
+    """
+    _invalidate_token_cache()
+    try:
+        token = _get_access_token_via_oauth()
+        profile = _api_get(token, "/users/me") or {}
+        return {
+            "status": "reconnected",
+            "user": profile.get("email", "unknown"),
+        }
+    except RuntimeError as exc:
+        return {"status": "failed", "error": str(exc)}
+
 
 @mcp.tool()
 def get_user_profile() -> dict:
@@ -310,7 +463,7 @@ def scan_recent_chats(hours: int = 6) -> dict:
     my_name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip() or "unknown"
     my_member_id = me.get("member_id", "")
 
-    now = datetime.now(IST)
+    now = datetime.now(UTC)
     lookback_start = now - timedelta(hours=hours)
 
     # Channels
