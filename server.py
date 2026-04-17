@@ -564,6 +564,129 @@ def scan_recent_chats(hours: int = 6) -> dict:
 
 
 @mcp.tool()
+def scan_direct_messages(hours: int = 6) -> dict:
+    """Scan recent 1:1 direct messages with all contacts and tag relevance.
+
+    Complements `scan_recent_chats` (which covers group channels) by fetching
+    messages from each of the user's Zoom chat contacts via the `to_contact`
+    endpoint. Each message is tagged with relevance (high/medium/low/none).
+
+    Args:
+        hours: Number of hours to look back (default 6).
+    """
+    token = _get_access_token()
+
+    # Profile
+    me = _api_get(token, "/users/me") or {}
+    my_email = me.get("email", "unknown")
+    my_name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip() or "unknown"
+    my_member_id = me.get("member_id", "")
+
+    now = datetime.now(UTC)
+    lookback_start = now - timedelta(hours=hours)
+
+    # Contacts — internal + external
+    contacts = []
+    seen_emails = set()
+    for contact_type in ("internal", "external"):
+        next_page_token = ""
+        while True:
+            params = {"type": contact_type, "page_size": 100}
+            if next_page_token:
+                params["next_page_token"] = next_page_token
+            try:
+                data = _api_get(token, "/chat/users/me/contacts", params)
+            except RuntimeError:
+                break
+            if not data:
+                break
+            for c in data.get("contacts", []):
+                email = c.get("email", "")
+                if email and email != my_email and email not in seen_emails:
+                    seen_emails.add(email)
+                    contacts.append(c)
+            next_page_token = data.get("next_page_token", "")
+            if not next_page_token:
+                break
+
+    dates_to_check = set()
+    current = lookback_start.date()
+    end = now.date()
+    while current <= end:
+        dates_to_check.add(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    sorted_dates = sorted(dates_to_check)
+
+    def _fetch_contact_messages(contact):
+        contact_email = contact.get("email", "")
+        contact_name = (
+            f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip()
+            or contact_email
+            or "Unknown Contact"
+        )
+        msgs = []
+        for date_str in sorted_dates:
+            npt = ""
+            while True:
+                params = {"to_contact": contact_email, "date": date_str, "page_size": 50}
+                if npt:
+                    params["next_page_token"] = npt
+                try:
+                    data = _api_get(token, "/chat/users/me/messages", params)
+                except Exception:
+                    break
+                if not data:
+                    break
+                for msg in data.get("messages", []):
+                    msg_time_str = msg.get("date_time", "")
+                    in_window = True
+                    if msg_time_str:
+                        try:
+                            msg_time = datetime.fromisoformat(msg_time_str.replace("Z", "+00:00"))
+                            in_window = lookback_start <= msg_time <= now
+                        except (ValueError, TypeError):
+                            pass
+                    if in_window:
+                        msg["_channel_name"] = f"DM: {contact_name}"
+                        msg["_channel_type"] = "DM"
+                        msgs.append(msg)
+                npt = data.get("next_page_token", "")
+                if not npt:
+                    break
+        return msgs
+
+    all_messages = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_contact_messages, c): c for c in contacts}
+        for future in as_completed(futures):
+            try:
+                all_messages.extend(future.result())
+            except Exception:
+                pass
+
+    enriched = _analyze_relevance(all_messages, my_email, my_name, my_member_id)
+    relevant = [m for m in enriched if m["relevance"] != "none"]
+    high = [m for m in enriched if m["relevance"] == "high"]
+    medium = [m for m in enriched if m["relevance"] == "medium"]
+
+    return {
+        "scan_metadata": {
+            "scan_time": now.isoformat(),
+            "lookback_hours": hours,
+            "lookback_start": lookback_start.isoformat(),
+            "user_email": my_email,
+            "user_name": my_name,
+            "total_contacts": len(contacts),
+            "total_messages": len(all_messages),
+            "relevant_messages": len(relevant),
+            "high_relevance": len(high),
+            "medium_relevance": len(medium),
+        },
+        "messages": enriched,
+    }
+
+
+@mcp.tool()
 def analyze_message_relevance(
     messages_json: str,
     user_email: str,

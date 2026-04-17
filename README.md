@@ -89,6 +89,7 @@ Open the cloned repo as the workspace folder so `${workspaceFolder}` resolves co
 | `list_channels` | Lists all Zoom chat channels the user belongs to (`id`, `jid`, `name`, `type`). |
 | `get_channel_messages` | Fetches messages for a channel **JID** between two ISO datetimes (`from_date`, `to_date`). |
 | `scan_recent_chats` | High-level scan: profile + all channels + messages in the last *N* hours (default 6), with **relevance** labels (`high` / `medium` / `low` / `none`) based on mentions, authorship, threads, and bots. |
+| `scan_direct_messages` | Like `scan_recent_chats`, but for 1:1 direct messages with internal/external contacts (uses Zoom's `to_contact` message endpoint). |
 | `analyze_message_relevance` | Takes a JSON string of raw Zoom message objects plus user identity fields and returns the same relevance analysis without calling the Zoom API. |
 
 Relevance rules (summary): **high** if you are @mentioned or you sent the message; **medium** if the message is in a thread you participated in; **low** otherwise; **none** for bot messages.
